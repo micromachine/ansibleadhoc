@@ -1,0 +1,155 @@
+---
+- hosts: rabbit-cluster
+  gather_facts: false
+  vars:
+    master: rabbitmq01
+    slave: rabbitmq02
+    cookie: H4yoWVXxaAGSvK0a2Lb62us1yUlFYUqAZO6kBoUfvmvXocRVIy
+    cookiefile: /var/lib/rabbitmq/.erlang.cookie
+  tasks:
+  - name: Check if epel-release is installed
+    yum:
+      list=epel-release
+    register: rpm_epel_release
+
+  - name: Add epel packages
+    yum:
+      name: epel-release
+      state: present
+    when: rpm_epel_release.results[0].yumstate == 'installed'
+
+  - name: Set hostname
+    hostname: name={{ inventory_hostname }}
+
+  - name: Check if Erlang is installed
+    shell: rpm -qa erlang --queryformat %{VERSION}
+    register: rpm_erlang_release
+
+#  - debug:
+#     msg: "{{rpm_erlang_release.stdout_lines}}"
+
+  - name: Add Erlang repository
+    yum_repository:
+      name: rabbitmq-erlang
+      description: rabbitmq-erlang
+      baseurl: https://dl.bintray.com/rabbitmq/rpm/erlang/20/el/7
+      gpgcheck: yes
+      gpgkey: https://dl.bintray.com/rabbitmq/Keys/rabbitmq-release-signing-key.asc
+      enabled: yes
+    when: rpm_erlang_release.stdout_lines != 0
+
+  - name: Upgrade system
+    yum:
+      name: '*'
+      state: latest
+
+  - name: Install packages
+    yum:
+      name: "{{item}}"
+      state: present
+    with_items:
+      - ntpdate
+      - ntp
+      - socat
+      - erlang
+
+  - name: Reload ntpd
+    service: name=ntpd enabled=yes state=restarted
+
+  - name: Check if Rabbitmq is installed
+    shell: rpm -qa rabbitmq-server --queryformat %{VERSION}
+    register: rabbitmq_version
+
+  - name: Install rabbitmq
+    yum:
+      name : https://dl.bintray.com/rabbitmq/all/rabbitmq-server/3.7.3/rabbitmq-server-3.7.3-1.el7.noarch.rpm
+      state: present
+    when: rabbitmq_version.stdout_lines != 0
+
+  - name: Add fw ports
+    firewalld:
+      port: "{{item}}"
+      permanent: true
+      state: enabled
+    with_items:
+      - 22/tcp
+      - 4369/tcp
+      - 25672/tcp
+      - 5671-5672/tcp
+      - 15672/tcp
+      - 61613-61614/tcp
+      - 1883/tcp
+      - 8883/tcp
+
+  - file:
+      path: /etc/systemd/system/rabbitmq-server.service.d/
+      state: directory
+
+  - file:
+      path: /etc/systemd/system/rabbitmq-server.service.d/limits.conf
+      state: touch
+
+  - file:
+     path: /var/lib/rabbitmq/.erlang.cookie
+     owner: rabbitmq
+     group: rabbitmq
+     mode: 0400
+     state: touch
+    when: rabbitmq_version.stdout_lines != 0
+
+  - name: Add to "{{cookiefile}}"
+    lineinfile: path="{{cookiefile}}" line='{{cookie}}'
+    with_items: "{{cookie}}"
+    when: rabbitmq_version.stdout_lines != 0
+
+  - name: Change OS limits for service
+    blockinfile:
+      path: /etc/systemd/system/rabbitmq-server.service.d/limits.conf
+      block: |
+        [Service]
+        LimitNOFILE=300000
+    notify:
+      - reload systemd
+      - restart rabbitmq
+    when: rabbitmq_version.stdout_lines != 0
+
+  - name: Reload fw rules
+    service: name=firewalld state=restarted
+
+  - name: Enable rabbitmq service
+    service: name=rabbitmq-server enabled=yes state=restarted
+    when: rabbitmq_version.stdout_lines != 0
+
+  - name: Stop slave node
+    shell:  rabbitmqctl stop_app
+    when: inventory_hostname != master
+
+  - name: Check if slave is in cluster
+    raw: rabbitmqctl cluster_status | grep {{slave}}
+    register: slave_exist_in_cluster
+    when: inventory_hostname == master
+
+  - name: Join slave to cluster
+    shell:  rabbitmqctl join_cluster --ram rabbit@{{master}}
+    ignore_errors: true
+    when: inventory_hostname != master and "slave not in slave_exist_in_cluster.stdout_lines"
+
+  - name: Print node status
+    shell: rabbitmqctl cluster_status
+    when: inventory_hostname == master
+
+  - name: Enables the rabbitmq_management plugin
+    rabbitmq_plugin:
+      names: '{{ item }}'
+      state: enabled
+    with_items:
+     - rabbitmq_management
+     - rabbitmq_shovel
+     - rabbitmq_shovel_management
+    when: rabbitmq_version.stdout_lines != 0
+
+  handlers:
+    - name: restart rabbitmq
+      service: name=rabbitmq-server state=restarted
+    - name: reload systemd
+      command: systemctl daemon-reload
